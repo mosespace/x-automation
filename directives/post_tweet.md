@@ -93,3 +93,9 @@ curl -X POST https://your-service-url/tweet \
 - **DUPLICATE_TWEET in a retry = success** — If X returns error 187 during a retry, the earlier attempt posted the tweet. The service correctly returns `success: true, tweet_id: null`.
 - **Rate limits:** Keep under ~50 tweets/day. Error 344 = daily limit, resets within 24h.
 - **X can return `errors` alongside a successful `tweet_results`** — The service always extracts `tweet_id` first. If `rest_id` is present, the tweet posted successfully.
+
+## 📦 Open Source / Repository Context (For Claude / AI Agents)
+- **Status:** This internal codebase was officially scrubbed, prepared, and pushed to the public GitHub repository (`elnino-hub/x-automation`) to act as an open-source lead-generation template for Product Siddha.
+- **Documentation:** A comprehensive `README.md` was generated, explaining the business problem (X's $100/mo API paywall). It explicitly clarifies that `API_KEY` is a local security password, *not* an X Developer Key, to prevent user confusion.
+- **Security:** Dead code was removed using `ruff` and `vulture`, and git history was validated to contain no leaked `.env` secrets.
+- **Future Changes:** When creating future scripts or modifying this directive, remember this code is now publicly visible. Changes must uphold strict security (no hardcoded payloads) and open-source readability standards. Ensure `README.md` is updated synchronously if this directive's underlying logic changes.
