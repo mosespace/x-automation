@@ -60,6 +60,10 @@ Fill in the variables:
 | `API_KEY` | Secret key sent in the `x-api-key` header to authenticate requests securely |
 | `PROXY_URL` | (Required in cloud) Residential proxy URL — format: `http://user:pass@host:port` |
 
+> 🔑 **Important Note on `API_KEY`:**  
+> This is **NOT** an official X Developer API Key! Since this service bypasses X's API, this variable is simply a custom "password" you create right now to protect your own deployment from unauthorized access. You must send this exact string via the `x-api-key` header when making POST requests so random bots can't tweet from your server.  
+> *To generate a secure key, run `python -c "import secrets; print(secrets.token_hex(32))"` in your terminal, or simply type a long random string.*
+
 **How to get your X Cookies:**
 1. Log in to [x.com](https://x.com) in your browser.
 2. Open DevTools (F12) → Application → Cookies → `https://x.com`.
