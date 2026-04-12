@@ -27,6 +27,7 @@ This repository solves that by mapping a Python backend directly to X's internal
 - **No Official API Required:** Runs entirely on session cookies (`auth_token` and `ct0`).
 - **Browser Fingerprinting:** Uses `curl_cffi` to mimic real Chrome (Chrome 136+) TLS patterns to bypass JA3/JA4 checks.
 - **Dynamic Session Extraction:** Auto-scrapes X's JavaScript bundles on startup to find the latest GraphQL `queryId` and `featureSwitches`.
+- **Resilient Scrape Retry Logic:** Failed bundle scrapes back off for 60 seconds before retrying — prevents retry storms on restricted networks (e.g. Render free tier).
 - **Advanced Header Management:** Dynamically generates `x-client-transaction-id` and maintains a stable `x-client-uuid` per session.
 - **Actionable Error Handling:** Cleans up ambiguous X API errors into readable flags (`AUTH_EXPIRED`, `RATE_LIMIT`, `DUPLICATE_TWEET`, `AUTOMATION_DETECTED`).
 - **n8n / Make Friendly:** Perfect for triggering from any workflow automation tool via a simple POST request.
@@ -99,7 +100,7 @@ curl -X POST http://localhost:8000/tweet \
 ```
 
 ### `GET /health`
-Returns the status of the dynamic GraphQL feature scraping. No authentication required. Useful for Keep-Alive pings.
+Returns the current cache state (queryId source, features, transaction context). No authentication required. Useful for Keep-Alive pings. **Does not trigger a bundle scrape** — reads from cache only, so pings are instant even when x.com is unreachable.
 
 ### `GET /ip`
 Returns the current outbound IP of the service. Highly recommended to verify your `PROXY_URL` is configured correctly.
@@ -132,9 +133,10 @@ To use this with n8n:
 ---
 
 ## ⚠️ Limitations & Caveats
-- **Rate Limits:** Keep it under ~50 tweets/day. Pushing this library too hard will result in X locking your account. 
+- **Rate Limits:** Keep it under ~50 tweets/day. Pushing this library too hard will result in X locking your account.
 - **Browser Impersonation Ages Out:** X constantly monitors TLS versions. If you suddenly get `AUTOMATION_DETECTED` errors, the hardcoded `BROWSER = "chrome136"` in `main.py` may need to be incremented to match the latest typical browser version supported by `curl_cffi`.
 - **"Duplicate Tweet" Error During Retry:** If a request pauses during transmission and retries, X might accept the first and reject the second as a duplicate. The API handles this gracefully (`success: true, tweet_id: null`).
+- **Bundle Scrape Timeouts on Free Hosting:** On Render's free tier, outbound requests to `x.com` JS bundles may time out. The service automatically falls back to hardcoded `FALLBACK_QUERY_ID` and `FALLBACK_FEATURES` — tweets will still post. Failed scrapes back off for 60 seconds before retrying to avoid log spam.
 
 ---
 
