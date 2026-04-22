@@ -79,7 +79,12 @@ uvicorn execution.main:app --host 0.0.0.0 --port 8000
 
 ## 📡 Endpoints
 
-X credentials (`auth_token`, `ct0`) are passed in the JSON body of each request. No server-side secrets required.
+X credentials are passed as **request headers** on every call — no server-side secrets required.
+
+| Header | Description |
+|---|---|
+| `x-auth-token` | `auth_token` cookie from your logged-in X browser session |
+| `x-ct0` | `ct0` cookie from your logged-in X browser session |
 
 ### `POST /tweet`
 Post a tweet to any X account.
@@ -87,24 +92,19 @@ Post a tweet to any X account.
 **Request:**
 ```bash
 curl -X POST http://localhost:8000/tweet \
+  -H "x-auth-token: YOUR_AUTH_TOKEN_COOKIE" \
+  -H "x-ct0: YOUR_CT0_COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{
-    "auth_token": "YOUR_AUTH_TOKEN_COOKIE",
-    "ct0": "YOUR_CT0_COOKIE",
-    "text": "Hello world from the unofficial API!"
-  }'
+  -d '{"text": "Hello world from the unofficial API!"}'
 ```
 
 **With optional media URLs:**
 ```bash
 curl -X POST http://localhost:8000/tweet \
+  -H "x-auth-token: YOUR_AUTH_TOKEN_COOKIE" \
+  -H "x-ct0: YOUR_CT0_COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{
-    "auth_token": "YOUR_AUTH_TOKEN_COOKIE",
-    "ct0": "YOUR_CT0_COOKIE",
-    "text": "Check out this image!",
-    "mediaUrls": ["https://example.com/image.jpg"]
-  }'
+  -d '{"text": "Check out this image!", "mediaUrls": ["https://example.com/image.jpg"]}'
 ```
 
 **Response:**
@@ -121,11 +121,8 @@ Fires a timestamped test tweet and returns the full raw X API response. Useful f
 **Request:**
 ```bash
 curl -X POST http://localhost:8000/debug-tweet \
-  -H "Content-Type: application/json" \
-  -d '{
-    "auth_token": "YOUR_AUTH_TOKEN_COOKIE",
-    "ct0": "YOUR_CT0_COOKIE"
-  }'
+  -H "x-auth-token: YOUR_AUTH_TOKEN_COOKIE" \
+  -H "x-ct0: YOUR_CT0_COOKIE"
 ```
 
 ### `GET /health`
@@ -153,14 +150,10 @@ To use this with n8n:
 - **Node:** HTTP Request
 - **Method:** `POST`
 - **URL:** `https://your-service-url.com/tweet`
-- **Body (JSON):**
-  ```json
-  {
-    "auth_token": "{{ $env.X_AUTH_TOKEN }}",
-    "ct0": "{{ $env.X_CT0 }}",
-    "text": "{{ $json.tweet_text }}"
-  }
-  ```
+- **Headers:**
+  - `x-auth-token`: `YOUR_AUTH_TOKEN_COOKIE`
+  - `x-ct0`: `YOUR_CT0_COOKIE`
+- **Body (JSON):** `{ "text": "{{ $json.tweet_text }}" }`
 - **Settings:** Set a timeout of `60 seconds` (to handle cold starts). Set retries to `2 attempts` spaced `5000ms` apart.
 
 *(Pro-Tip: Set up a Cron trigger to hit `GET /health` every 14 minutes to prevent your cloud container from spinning down).*
