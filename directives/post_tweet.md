@@ -4,15 +4,18 @@
 Expose HTTP endpoints that accept a tweet payload (including X session credentials) and post it to X (Twitter). Credentials are passed per-request — the service holds no secrets server-side.
 
 ## Inputs
-- `POST /tweet` with JSON body:
-  - `auth_token` (string, required): `auth_token` cookie from a logged-in X browser session
-  - `ct0` (string, required): `ct0` cookie from a logged-in X browser session
+
+All authenticated endpoints require these **request headers**:
+| Header | Description |
+|---|---|
+| `x-auth-token` | `auth_token` cookie from a logged-in X browser session |
+| `x-ct0` | `ct0` cookie from a logged-in X browser session |
+
+- `POST /tweet` — headers above + JSON body:
   - `text` (string, required): Tweet content, max 280 chars
   - `mediaUrls` (list of strings, optional): Public image URLs to attach
 
-- `POST /debug-tweet` with JSON body:
-  - `auth_token` (string, required): `auth_token` cookie from a logged-in X browser session
-  - `ct0` (string, required): `ct0` cookie from a logged-in X browser session
+- `POST /debug-tweet` — headers above, no body required
 
 ## Outputs
 - `200 OK`: `{ "success": true, "tweet_id": "<id>" }`
@@ -61,21 +64,18 @@ This service is designed to run on any platform that supports Python (Render, Ra
 ## Test Command
 ```bash
 curl -X POST https://your-service-url/tweet \
+  -H "x-auth-token: YOUR_AUTH_TOKEN_COOKIE" \
+  -H "x-ct0: YOUR_CT0_COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{
-    "auth_token": "YOUR_AUTH_TOKEN_COOKIE",
-    "ct0": "YOUR_CT0_COOKIE",
-    "text": "Hello from X Automation!"
-  }'
+  -d '{"text": "Hello from X Automation!"}'
 ```
 
 ## n8n Integration Example
 - HTTP Request node → `POST https://your-service-url/tweet`
+- Headers: `x-auth-token: <value>`, `x-ct0: <value>`
 - Body (JSON):
   ```json
   {
-    "auth_token": "{{ $env.X_AUTH_TOKEN }}",
-    "ct0": "{{ $env.X_CT0 }}",
     "text": "{{ $json.tweet_text }}",
     "mediaUrls": []
   }
@@ -107,7 +107,7 @@ curl -X POST https://your-service-url/tweet \
 - **DUPLICATE_TWEET in a retry = success** — If X returns error 187 during a retry, the earlier attempt posted the tweet. The service correctly returns `success: true, tweet_id: null`.
 - **Rate limits:** Keep under ~50 tweets/day. Error 344 = daily limit, resets within 24h.
 - **X can return `errors` alongside a successful `tweet_results`** — The service always extracts `tweet_id` first. If `rest_id` is present, the tweet posted successfully.
-- **Per-request credentials** — `auth_token` and `ct0` are passed in every request body, making the service fully stateless. A single deployment can serve multiple X accounts simultaneously.
+- **Per-request credentials** — `auth_token` and `ct0` are passed as `x-auth-token` and `x-ct0` headers on every request, making the service fully stateless. A single deployment can serve multiple X accounts simultaneously.
 
 ## 📦 Open Source / Repository Context (For Claude / AI Agents)
 - **Status:** This internal codebase was officially scrubbed, prepared, and pushed to the public GitHub repository (`elnino-hub/x-automation`) to act as an open-source lead-generation template for Product Siddha.

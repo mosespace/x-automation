@@ -26,7 +26,7 @@ import uuid
 
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from x_client_transaction import ClientTransaction
@@ -336,8 +336,6 @@ def _classify_error(data: dict, status_code: int) -> str:
 
 
 class TweetRequest(BaseModel):
-    auth_token: str = Field(..., description="auth_token cookie from your X browser session")
-    ct0: str = Field(..., description="ct0 cookie from your X browser session")
     text: str = Field(..., description="Tweet content, max 280 characters")
     mediaUrls: list[str] = Field(default=[], description="Public image URLs to attach")
 
@@ -346,11 +344,6 @@ class TweetResponse(BaseModel):
     success: bool
     tweet_id: str | None = None
     error: str | None = None
-
-
-class DebugTweetRequest(BaseModel):
-    auth_token: str = Field(..., description="auth_token cookie from your X browser session")
-    ct0: str = Field(..., description="ct0 cookie from your X browser session")
 
 
 async def _attempt_tweet(text: str, query_id: str, auth_token: str, ct0: str) -> dict:
@@ -380,11 +373,15 @@ def _extract_tweet_id(data: dict) -> str | None:
 
 
 @app.post("/tweet", response_model=TweetResponse)
-async def post_tweet(payload: TweetRequest):
+async def post_tweet(
+    payload: TweetRequest,
+    x_auth_token: str = Header(..., alias="x-auth-token", description="auth_token cookie from your X browser session"),
+    x_ct0: str = Header(..., alias="x-ct0", description="ct0 cookie from your X browser session"),
+):
     try:
         # Attempt 1: use cached queryId
         query_id = await _get_create_tweet_id()
-        result = await _attempt_tweet(payload.text, query_id, payload.auth_token, payload.ct0)
+        result = await _attempt_tweet(payload.text, query_id, x_auth_token, x_ct0)
         data = result["data"]
         status = result["status_code"]
 
@@ -410,7 +407,7 @@ async def post_tweet(payload: TweetRequest):
         new_query_id = await _get_create_tweet_id(force_refresh=True)
 
         log.info(f"queryId: {query_id} → {new_query_id}. Retrying...")
-        result = await _attempt_tweet(payload.text, new_query_id, payload.auth_token, payload.ct0)
+        result = await _attempt_tweet(payload.text, new_query_id, x_auth_token, x_ct0)
         data = result["data"]
         status = result["status_code"]
 
@@ -466,7 +463,10 @@ async def check_ip():
 
 
 @app.post("/debug-tweet")
-async def debug_tweet(payload: DebugTweetRequest):
+async def debug_tweet(
+    x_auth_token: str = Header(..., alias="x-auth-token", description="auth_token cookie from your X browser session"),
+    x_ct0: str = Header(..., alias="x-ct0", description="ct0 cookie from your X browser session"),
+):
     """Fire a test tweet and return the full raw X response for debugging."""
     text = f"debug {datetime.datetime.utcnow().isoformat()}"
     query_id = await _get_create_tweet_id()
@@ -477,7 +477,7 @@ async def debug_tweet(payload: DebugTweetRequest):
         body = _build_tweet_payload(text, query_id)
         resp = await session.post(
             url,
-            headers=_build_headers(payload.auth_token, payload.ct0, method="POST", path=path),
+            headers=_build_headers(x_auth_token, x_ct0, method="POST", path=path),
             json=body,
             timeout=30,
         )
