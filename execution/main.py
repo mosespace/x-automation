@@ -26,7 +26,7 @@ import uuid
 
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from x_client_transaction import ClientTransaction
@@ -41,6 +41,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("x-automation")
 
 PROXY_URL = os.environ.get("PROXY_URL")
+# Optional shared secret. When set, /tweet, /debug-tweet and /ip require an
+# `x-api-key` header with this value. /health stays open for health checks.
+SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY")
 
 BROWSER = "chrome136"
 
@@ -96,13 +99,14 @@ _features_cache: dict = {}
 _transaction_ctx: ClientTransaction | None = None
 _cache_ts: float = 0
 _last_scrape_attempt: float = 0
+_last_scrape_error: str | None = None
 CACHE_TTL = 3600  # 1 hour
 SCRAPE_RETRY_COOLDOWN = 60  # seconds to wait after a failed scrape before retrying
 
 
 async def _scrape_gql_config() -> dict[str, str]:
     """Fetch current GraphQL queryIds, features, and transaction context from X's JS bundles."""
-    global _gql_cache, _features_cache, _transaction_ctx, _cache_ts, _last_scrape_attempt
+    global _gql_cache, _features_cache, _transaction_ctx, _cache_ts, _last_scrape_attempt, _last_scrape_error
 
     if _gql_cache and (time.time() - _cache_ts) < CACHE_TTL:
         return _gql_cache
@@ -201,12 +205,17 @@ async def _scrape_gql_config() -> dict[str, str]:
                     continue
 
             if ops:
+                _last_scrape_error = None
                 _gql_cache = ops
                 _cache_ts = time.time()
                 _last_scrape_attempt = 0  # reset so next cache expiry retries immediately
                 ct_id = ops.get("CreateTweet", "NOT FOUND")
                 log.info(f"Scraped {len(ops)} operations. CreateTweet={ct_id}")
             else:
+                _last_scrape_error = (
+                    f"0 operations from {len(script_urls)} bundles "
+                    f"(x.com returned {resp.status_code}; the IP may be blocked)"
+                )
                 log.warning(
                     "Bundle scrape returned 0 operations, keeping cache/fallback"
                 )
@@ -217,6 +226,7 @@ async def _scrape_gql_config() -> dict[str, str]:
                 log.warning("No features scraped, will use FALLBACK_FEATURES")
 
     except Exception as exc:
+        _last_scrape_error = str(exc)
         log.warning(f"Bundle scrape failed: {exc}, using fallback")
 
     return _gql_cache
@@ -251,6 +261,11 @@ app = FastAPI(title="X Automation Service")
 async def startup():
     """Pre-warm the queryId cache on deploy so first tweet is fast."""
     await _scrape_gql_config()
+
+
+def require_api_key(x_api_key: str | None = Header(default=None, alias="x-api-key")):
+    if SERVICE_API_KEY and x_api_key != SERVICE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
 
 
 def _build_headers(auth_token: str, ct0: str, method: str = "POST", path: str = "") -> dict:
@@ -308,11 +323,21 @@ def _build_tweet_payload(
 # ── Error classification ────────────────────────────────────────────
 def _classify_error(data: dict, status_code: int) -> str:
     """Turn raw X response into an actionable error message."""
-    if status_code == 401 or status_code == 403:
-        return "AUTH_EXPIRED: Cookies (auth_token/ct0) are invalid or expired. Re-export from browser."
+    errors = data.get("errors", []) if isinstance(data, dict) else []
 
-    errors = data.get("errors", [])
+    # 403 is also what X returns for a missing/invalid x-client-transaction-id,
+    # so only call it expired cookies when X's error code says so (below) or
+    # the status is a plain 401.
     if not errors:
+        if status_code == 401:
+            return "AUTH_EXPIRED: Cookies (auth_token/ct0) are invalid or expired. Re-export from browser."
+        if status_code == 403:
+            ctx = "active" if _transaction_ctx else "unavailable"
+            return (
+                f"FORBIDDEN: X refused the request (403) without an error code. "
+                f"Usually a blocked IP or missing transaction id (transaction_ctx={ctx}), "
+                f"not expired cookies. Check /health and PROXY_URL."
+            )
         return ""
 
     code = errors[0].get("code") or errors[0].get("extensions", {}).get("code")
@@ -327,6 +352,7 @@ def _classify_error(data: dict, status_code: int) -> str:
         131: "INTERNAL_ERROR: X internal error. Wait and retry.",
         187: "DUPLICATE_TWEET: This exact text was already posted recently. Make it unique.",
         226: "AUTOMATION_DETECTED: Request flagged as automated. Check TLS fingerprint / proxy.",
+        353: "AUTH_EXPIRED: ct0 doesn't match this session. Re-export both cookies from the same browser.",
         261: "APP_SUSPENDED: Application write access suspended.",
         326: "ACCOUNT_LOCKED: Account temporarily locked. Log in via browser to unlock.",
         344: "RATE_LIMIT: Daily tweet limit reached. Wait 24h.",
@@ -359,7 +385,12 @@ async def _attempt_tweet(text: str, query_id: str, auth_token: str, ct0: str) ->
             json=body,
             timeout=30,
         )
-    return {"status_code": resp.status_code, "data": resp.json()}
+    try:
+        data = resp.json()
+    except Exception:
+        # Blocked requests often come back as an HTML page, not JSON
+        data = {"raw": resp.text[:500]}
+    return {"status_code": resp.status_code, "data": data}
 
 
 def _extract_tweet_id(data: dict) -> str | None:
@@ -372,7 +403,7 @@ def _extract_tweet_id(data: dict) -> str | None:
         return None
 
 
-@app.post("/tweet", response_model=TweetResponse)
+@app.post("/tweet", response_model=TweetResponse, dependencies=[Depends(require_api_key)])
 async def post_tweet(
     payload: TweetRequest,
     x_auth_token: str = Header(..., alias="x-auth-token", description="auth_token cookie from your X browser session"),
@@ -398,8 +429,6 @@ async def post_tweet(
         # No tweet_id found — check for explicit errors
         if "errors" in data:
             err = _classify_error(data, status)
-            if err.startswith("DUPLICATE_TWEET"):
-                return TweetResponse(success=True, tweet_id=None)
             return TweetResponse(success=False, error=err)
 
         # Empty tweet_results → likely stale queryId. Force-refresh and retry once.
@@ -421,8 +450,6 @@ async def post_tweet(
 
         if "errors" in data:
             err = _classify_error(data, status)
-            if err.startswith("DUPLICATE_TWEET"):
-                return TweetResponse(success=True, tweet_id=None)
             return TweetResponse(success=False, error=err)
 
         # Still empty after retry
@@ -451,10 +478,13 @@ async def health():
         "features_count": len(features),
         "transaction_ctx": "active" if _transaction_ctx else "unavailable",
         "cache_age_seconds": int(time.time() - _cache_ts) if _cache_ts else None,
+        "last_scrape_error": _last_scrape_error,
+        "proxy_configured": bool(PROXY_URL),
+        "api_key_required": bool(SERVICE_API_KEY),
     }
 
 
-@app.get("/ip")
+@app.get("/ip", dependencies=[Depends(require_api_key)])
 async def check_ip():
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
@@ -462,7 +492,7 @@ async def check_ip():
         return {"proxy_configured": bool(PROXY_URL), "ip": resp.json()}
 
 
-@app.post("/debug-tweet")
+@app.post("/debug-tweet", dependencies=[Depends(require_api_key)])
 async def debug_tweet(
     x_auth_token: str = Header(..., alias="x-auth-token", description="auth_token cookie from your X browser session"),
     x_ct0: str = Header(..., alias="x-ct0", description="ct0 cookie from your X browser session"),
