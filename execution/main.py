@@ -16,6 +16,7 @@ Endpoints:
     GET  /ip             — Outbound IP (verify proxy routing)
 """
 
+import asyncio
 import datetime
 import json
 import logging
@@ -25,6 +26,7 @@ import time
 import uuid
 
 from bs4 import BeautifulSoup
+from curl_cffi import CurlMime
 from curl_cffi.requests import AsyncSession
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -320,6 +322,124 @@ def _build_tweet_payload(
     }
 
 
+# ── Media upload ────────────────────────────────────────────────────
+UPLOAD_URL = "https://upload.x.com/i/media/upload.json"
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_GIF_BYTES = 15 * 1024 * 1024
+CHUNK_BYTES = 2 * 1024 * 1024
+IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+
+class MediaError(Exception):
+    """An image couldn't be fetched or uploaded. The message is shown to callers."""
+
+
+def _upload_headers(auth_token: str, ct0: str) -> dict:
+    headers = _build_headers(auth_token, ct0)
+    headers.pop("content-type", None)  # multipart / query-string requests
+    return headers
+
+
+async def _download_image(url: str) -> tuple[bytes, str]:
+    # Fetched directly (not via the proxy): it's our own storage, not X
+    async with AsyncSession(impersonate=BROWSER) as s:
+        resp = await s.get(url, timeout=30)
+    if resp.status_code != 200:
+        raise MediaError(f"MEDIA_DOWNLOAD_FAILED: {url} returned {resp.status_code}")
+    media_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if media_type not in IMAGE_TYPES:
+        raise MediaError(f"MEDIA_UNSUPPORTED: {media_type or 'unknown type'} (use JPEG, PNG, WebP or GIF)")
+    data = resp.content
+    limit = MAX_GIF_BYTES if media_type == "image/gif" else MAX_IMAGE_BYTES
+    if len(data) > limit:
+        raise MediaError(f"MEDIA_TOO_LARGE: {len(data) // 1024} KB is over X's {limit // (1024 * 1024)} MB limit")
+    return data, media_type
+
+
+async def _upload_image(url: str, auth_token: str, ct0: str) -> str:
+    """Upload one image with X's chunked INIT/APPEND/FINALIZE flow; returns media_id."""
+    data, media_type = await _download_image(url)
+    category = "tweet_gif" if media_type == "image/gif" else "tweet_image"
+    headers = _upload_headers(auth_token, ct0)
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+
+    async with AsyncSession(impersonate=BROWSER, proxies=proxies) as s:
+        init = await s.post(
+            UPLOAD_URL,
+            params={
+                "command": "INIT",
+                "total_bytes": str(len(data)),
+                "media_type": media_type,
+                "media_category": category,
+            },
+            headers=headers,
+            timeout=30,
+        )
+        if init.status_code not in (200, 201, 202):
+            try:
+                init_body = init.json()
+            except Exception:
+                init_body = {}
+            # Expired cookies show up here first when a tweet has images
+            err = _classify_error(init_body, init.status_code)
+            if err.startswith("AUTH_EXPIRED"):
+                raise MediaError(err)
+            raise MediaError(f"MEDIA_UPLOAD_FAILED: INIT returned {init.status_code} {init.text[:200]}")
+        media_id = init.json().get("media_id_string")
+        if not media_id:
+            raise MediaError(f"MEDIA_UPLOAD_FAILED: INIT returned no media_id {init.text[:200]}")
+
+        for index, start in enumerate(range(0, len(data), CHUNK_BYTES)):
+            mime = CurlMime()
+            mime.addpart(
+                name="media",
+                content_type="application/octet-stream",
+                filename="blob",
+                data=data[start : start + CHUNK_BYTES],
+            )
+            try:
+                append = await s.post(
+                    UPLOAD_URL,
+                    params={"command": "APPEND", "media_id": media_id, "segment_index": str(index)},
+                    headers=headers,
+                    multipart=mime,
+                    timeout=60,
+                )
+            finally:
+                mime.close()
+            if append.status_code not in (200, 201, 202, 204):
+                raise MediaError(f"MEDIA_UPLOAD_FAILED: APPEND returned {append.status_code} {append.text[:200]}")
+
+        final = await s.post(
+            UPLOAD_URL,
+            params={"command": "FINALIZE", "media_id": media_id},
+            headers=headers,
+            timeout=30,
+        )
+        if final.status_code not in (200, 201, 202):
+            raise MediaError(f"MEDIA_UPLOAD_FAILED: FINALIZE returned {final.status_code} {final.text[:200]}")
+
+        # Images are usually ready at once; GIFs may need processing
+        info = final.json().get("processing_info")
+        for _ in range(10):
+            if not info or info.get("state") == "succeeded":
+                break
+            if info.get("state") == "failed":
+                raise MediaError(f"MEDIA_UPLOAD_FAILED: X couldn't process the image ({info.get('error', {}).get('message', 'unknown')})")
+            await asyncio.sleep(min(int(info.get("check_after_secs", 1)), 5))
+            status = await s.get(
+                UPLOAD_URL,
+                params={"command": "STATUS", "media_id": media_id},
+                headers=headers,
+                timeout=30,
+            )
+            info = status.json().get("processing_info")
+
+    log.info(f"Uploaded {media_type} ({len(data) // 1024} KB) as media {media_id}")
+    return media_id
+
+
 # ── Error classification ────────────────────────────────────────────
 def _classify_error(data: dict, status_code: int) -> str:
     """Turn raw X response into an actionable error message."""
@@ -372,13 +492,19 @@ class TweetResponse(BaseModel):
     error: str | None = None
 
 
-async def _attempt_tweet(text: str, query_id: str, auth_token: str, ct0: str) -> dict:
+async def _attempt_tweet(
+    text: str,
+    query_id: str,
+    auth_token: str,
+    ct0: str,
+    media_ids: list[str] | None = None,
+) -> dict:
     """Fire a single CreateTweet request. Returns raw parsed JSON."""
     path = f"/i/api/graphql/{query_id}/CreateTweet"
     url = f"https://x.com{path}"
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
-        body = _build_tweet_payload(text, query_id)
+        body = _build_tweet_payload(text, query_id, media_ids)
         resp = await session.post(
             url,
             headers=_build_headers(auth_token, ct0, method="POST", path=path),
@@ -410,9 +536,21 @@ async def post_tweet(
     x_ct0: str = Header(..., alias="x-ct0", description="ct0 cookie from your X browser session"),
 ):
     try:
+        # Upload images first; a failed upload fails the tweet rather than
+        # silently posting it without the image the caller asked for.
+        if len(payload.mediaUrls) > MAX_IMAGES:
+            return TweetResponse(success=False, error=f"MEDIA_TOO_MANY: X allows up to {MAX_IMAGES} images per post")
+        try:
+            media_ids = [
+                await _upload_image(url, x_auth_token, x_ct0) for url in payload.mediaUrls
+            ]
+        except MediaError as exc:
+            log.warning(str(exc))
+            return TweetResponse(success=False, error=str(exc))
+
         # Attempt 1: use cached queryId
         query_id = await _get_create_tweet_id()
-        result = await _attempt_tweet(payload.text, query_id, x_auth_token, x_ct0)
+        result = await _attempt_tweet(payload.text, query_id, x_auth_token, x_ct0, media_ids)
         data = result["data"]
         status = result["status_code"]
 
@@ -436,7 +574,7 @@ async def post_tweet(
         new_query_id = await _get_create_tweet_id(force_refresh=True)
 
         log.info(f"queryId: {query_id} → {new_query_id}. Retrying...")
-        result = await _attempt_tweet(payload.text, new_query_id, x_auth_token, x_ct0)
+        result = await _attempt_tweet(payload.text, new_query_id, x_auth_token, x_ct0, media_ids)
         data = result["data"]
         status = result["status_code"]
 
