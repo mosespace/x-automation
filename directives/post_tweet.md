@@ -58,7 +58,7 @@ This service is designed to run on any platform that supports Python (Render, Ra
 |---|---|---|---|
 | `POST` | `/tweet` | `auth_token` + `ct0` in body | Post a tweet |
 | `POST` | `/debug-tweet` | `auth_token` + `ct0` in body | Post a test tweet and return full raw X API response |
-| `GET` | `/health` | none | Status: queryId source, features source, cache age. Reads from cache only — does NOT trigger a scrape. Safe for high-frequency keep-alive pings. |
+| `GET` | `/health` | none | Status: mutation id source, transaction context, cache age, last scrape error. Reads from cache only — does NOT trigger a scrape. Safe for high-frequency keep-alive pings. |
 | `GET` | `/ip` | none | Outbound IP (verify proxy is routing correctly) |
 
 ## Test Command
@@ -87,13 +87,13 @@ curl -X POST https://your-service-url/tweet \
 ## How the Service Works
 
 ### Self-healing behaviors
-1. **queryId rotation** — X's GraphQL `queryId` for CreateTweet changes periodically. The service scrapes X's JS bundles at startup, caches for 1 hour, and auto-refreshes on failure.
+1. **Mutation id rotation** — X's web client (`abs.twimg.com/x-web`) posts with the persisted Relay mutation `createTweetMutation` at `api.x.com/graphql/{id}/createTweetMutation`. The id changes with X deploys. The service follows the page's entry scripts to `startup-dynamic-*.js`, then to the composer chunk, caches for 1 hour, and auto-refreshes on failure.
 2. **Scrape retry backoff** — If a bundle scrape fails (e.g. network timeout on Render free tier), the service waits 60 seconds (`SCRAPE_RETRY_COOLDOWN`) before retrying. Prevents retry storms from hammering x.com on every request. Resets to immediate retry after a successful scrape.
-3. **Feature flags** — `featureSwitches` scraped from JS bundles alongside the queryId. Falls back to hardcoded `FALLBACK_FEATURES` if scraping fails.
-4. **x-client-transaction-id** — Generated per-request using the `xclienttransaction` library (parses X homepage animation data). Falls back gracefully if init fails.
+3. **Request body** — `{queryId, variables}` with no `features` object. `variables` carries `tweet_text`, optional `media`, and the Relay provided variables (`__relay_internal__pv__*`) the mutation declares.
+4. **x-client-transaction-id** — Generated per-request using the `xclienttransaction` library, fed the homepage plus `sign.o-*.js` (lazy-loaded from `startup-dynamic`; it replaced the old `ondemand.s`). Without it X answers with error 226 (AUTOMATION_DETECTED), so `/health` must show `transaction_ctx: active`.
 5. **x-client-uuid** — Stable UUID4 generated at startup, mimics a persistent browser tab session.
 6. **Error classification** — Actionable error labels returned: `AUTH_EXPIRED`, `RATE_LIMIT`, `DUPLICATE_TWEET`, `AUTOMATION_DETECTED`, `PROXY_ERROR`, `ACCOUNT_LOCKED`, etc.
-7. **Fallback safety** — If bundle scraping fails, falls back to last-known-good queryId and features.
+7. **Fallback safety** — If bundle scraping fails, falls back to the last-known-good mutation id (no transaction id, so expect 226 errors until a scrape succeeds).
 8. **Browser-version headers** — `sec-ch-ua` headers are NOT set manually; `curl_cffi` injects them consistent with its TLS fingerprint to prevent detection mismatches.
 
 ### What still requires manual action
