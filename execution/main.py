@@ -11,6 +11,8 @@ Setup:
 
 Endpoints:
     POST /tweet          — Post a tweet (pass auth_token + ct0 in body)
+    POST /login/start    — Log in with username + password, returns cookies
+    POST /login/continue — Answer a 2FA / confirmation step of a login
     POST /debug-tweet    — Post a test tweet and return raw X response
     GET  /health         — Service status and cache diagnostics
     GET  /ip             — Outbound IP (verify proxy routing)
@@ -32,11 +34,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from x_client_transaction import ClientTransaction
-from x_client_transaction.constants import (
-    ON_DEMAND_FILE_REGEX,
-    ON_DEMAND_HASH_PATTERN,
-    ON_DEMAND_FILE_URL,
-)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -56,48 +53,34 @@ CLIENT_UUID = str(uuid.uuid4())
 BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 
 # ── Dynamic GraphQL config ──────────────────────────────────────────
-# Scraped at runtime from X's JS bundles. Fallback to last-known-good.
-FALLBACK_QUERY_ID = "S1qcGUn68_U0lDKdMlYSGg"
-FALLBACK_FEATURES = {
-    "premium_content_api_read_enabled": False,
-    "communities_web_enable_tweet_community_results_fetch": True,
-    "articles_preview_enabled": True,
-    "c9s_tweet_anatomy_moderator_badge_enabled": True,
-    "content_disclosure_ai_generated_indicator_enabled": True,
-    "content_disclosure_indicator_enabled": True,
-    "freedom_of_speech_not_reach_fetch_enabled": True,
-    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-    "longform_notetweets_consumption_enabled": True,
-    "longform_notetweets_inline_media_enabled": False,
-    "longform_notetweets_rich_text_read_enabled": True,
-    "post_ctas_fetch_enabled": True,
-    "profile_label_improvements_pcf_label_in_post_enabled": True,
-    "responsive_web_edit_tweet_api_enabled": True,
-    "responsive_web_enhance_cards_enabled": False,
-    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-    "responsive_web_graphql_timeline_navigation_enabled": True,
-    "responsive_web_grok_analysis_button_from_backend": True,
-    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
-    "responsive_web_grok_analyze_post_followups_enabled": True,
-    "responsive_web_grok_annotations_enabled": True,
-    "responsive_web_grok_community_note_auto_translation_is_enabled": False,
-    "responsive_web_grok_image_annotation_enabled": True,
-    "responsive_web_grok_imagine_annotation_enabled": True,
-    "responsive_web_grok_share_attachment_enabled": True,
-    "responsive_web_grok_show_grok_translated_post": False,
-    "responsive_web_jetfuel_frame": True,
-    "responsive_web_profile_redirect_enabled": False,
-    "responsive_web_twitter_article_tweet_consumption_enabled": True,
-    "rweb_tipjar_consumption_enabled": False,
-    "standardized_nudges_misinfo": True,
-    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
-    "verified_phone_label_enabled": True,
-    "view_counts_everywhere_api_enabled": True,
+# X's web client (abs.twimg.com/x-web) posts through a persisted Relay
+# mutation. Its id, and the script that signs x-client-transaction-id, are
+# scraped from X's JS at runtime. The fallback is the last id seen there.
+ASSETS_URL = "https://abs.twimg.com/x-web/x-web/assets/"
+GRAPHQL_URL = "https://api.x.com/graphql"
+CREATE_TWEET_OP = "createTweetMutation"
+FALLBACK_QUERY_ID = "CQg_EnWgzRTsnDVd7FFZJw"
+# Lazy chunks the composer has been bundled into, checked in order
+COMPOSER_CHUNKS = ("media-upload-button", "tweet-composer-slot", "schedule-button")
+CREATE_TWEET_RE = re.compile(
+    r'params:\{id:[`"]([\w-]+)[`"],metadata:\{\},name:[`"]createTweetMutation[`"]'
+    r',operationKind:[`"]mutation[`"],text:null(?:,providedVariables:\{([^}]*)\})?'
+)
+
+# Relay "provided variables" the mutation declares. The web client sends one
+# per declared name; they only switch optional fields of the response.
+PROVIDED_VARIABLES = {
+    "__relay_internal__pv__xclientsfeaturesappviewerisloggedinrelayprovider": True,
+    "__relay_internal__pv__xclientsfeaturestweetcomponentsgrokanalyzepostrelayprovider": False,
+    "__relay_internal__pv__xclientsfeaturestranslationnoteautotranslationenabledrelayprovider": False,
+    "__relay_internal__pv__xclientsfeaturestranslationgroktranslatedpostenabledrelayprovider": True,
+    "__relay_internal__pv__liveeventpostcontextenabledrelayprovider": False,
+    "__relay_internal__pv__sportspostcontextenabledrelayprovider": False,
 }
 
 # In-memory cache
-_gql_cache: dict = {}
-_features_cache: dict = {}
+_query_id: str | None = None
+_provided_names: list[str] = []
 _transaction_ctx: ClientTransaction | None = None
 _cache_ts: float = 0
 _last_scrape_attempt: float = 0
@@ -106,24 +89,35 @@ CACHE_TTL = 3600  # 1 hour
 SCRAPE_RETRY_COOLDOWN = 60  # seconds to wait after a failed scrape before retrying
 
 
-async def _scrape_gql_config() -> dict[str, str]:
-    """Fetch current GraphQL queryIds, features, and transaction context from X's JS bundles."""
-    global _gql_cache, _features_cache, _transaction_ctx, _cache_ts, _last_scrape_attempt, _last_scrape_error
+def _asset_names(text: str, prefix: str) -> list[str]:
+    """Hashed asset filenames like `sign.o-DInG6T4Q.js` referenced in text."""
+    found = re.findall(rf"(?<![\w.-])({re.escape(prefix)}-[\w-]{{8}}\.js)", text)
+    return list(dict.fromkeys(found))
 
-    if _gql_cache and (time.time() - _cache_ts) < CACHE_TTL:
-        return _gql_cache
+
+async def _scrape_gql_config() -> None:
+    """Refresh the createTweetMutation id and the transaction-id context from X's JS."""
+    global _query_id, _provided_names, _transaction_ctx, _cache_ts, _last_scrape_attempt, _last_scrape_error
+
+    if _query_id and _transaction_ctx and (time.time() - _cache_ts) < CACHE_TTL:
+        return
 
     # If the last scrape attempt failed recently, don't hammer the network
     now = time.time()
     if _last_scrape_attempt and (now - _last_scrape_attempt) < SCRAPE_RETRY_COOLDOWN:
-        return _gql_cache  # return empty dict; caller will use fallback
+        return
 
     _last_scrape_attempt = now
-    log.info("Scraping X JS bundles for fresh queryIds + features...")
+    log.info("Scraping X JS bundles for createTweetMutation + transaction context...")
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
 
     try:
         async with AsyncSession(impersonate=BROWSER, proxies=proxies) as s:
+
+            async def fetch_asset(name: str) -> str:
+                r = await s.get(ASSETS_URL + name, timeout=15)
+                return r.text if r.status_code == 200 else ""
+
             # Fetch a public X page to find script URLs
             resp = await s.get("https://x.com/x", timeout=15)
             html = resp.text
@@ -134,125 +128,91 @@ async def _scrape_gql_config() -> dict[str, str]:
                 resp = await s.get(url, timeout=15)
                 html = resp.text
 
-            # ── Build ClientTransaction for x-client-transaction-id ──
-            try:
-                soup = BeautifulSoup(html, "html.parser")
+            # The page links a few entry chunks. One of them imports
+            # startup-dynamic, which lazy-loads the signing script and composer.
+            entries = list(dict.fromkeys(
+                re.findall(r"https://abs\.twimg\.com/x-web/x-web/assets/([\w.-]+\.js)", html)
+            ))
+            dynamic = ""
+            for entry in entries:
+                names = _asset_names(await fetch_asset(entry), "startup-dynamic")
+                if names:
+                    dynamic = await fetch_asset(names[0])
+                    break
+            if not dynamic:
+                raise RuntimeError(
+                    f"startup-dynamic chunk not found in {len(entries)} entry scripts "
+                    f"(x.com returned {resp.status_code}). X may have changed its web client."
+                )
 
-                # Find the ondemand.s JS file hash from the main page
-                ondemand_match = ON_DEMAND_FILE_REGEX.search(html)
-                if ondemand_match:
-                    chunk_id = ondemand_match.group(1)
-                    hash_pattern = ON_DEMAND_HASH_PATTERN.format(chunk_id)
-                    hash_match = re.search(hash_pattern, html)
-                    if hash_match:
-                        ondemand_url = ON_DEMAND_FILE_URL.format(
-                            filename=hash_match.group(1)
-                        )
-                        od_resp = await s.get(ondemand_url, timeout=15)
-                        if od_resp.status_code == 200:
-                            _transaction_ctx = ClientTransaction(soup, od_resp.text)
-                            log.info("ClientTransaction initialized successfully")
-                        else:
-                            log.warning(
-                                f"ondemand.s fetch returned {od_resp.status_code}"
-                            )
-                    else:
-                        log.warning("Could not find ondemand hash in page source")
-                else:
-                    log.warning("Could not find ondemand chunk ID in page source")
-            except Exception as exc:
-                log.warning(f"ClientTransaction init failed: {exc}")
-
-            # ── Extract queryIds and features from JS bundles ──
-            script_urls = re.findall(
-                r'src="(https://abs\.twimg\.com/responsive-web/client-web[^"]+\.js)"',
-                html,
-            )
-            log.info(f"Found {len(script_urls)} JS bundles to scan")
-
-            ops = {}
-            ops_features = {}
-            for url in script_urls:
+            # ── x-client-transaction-id context ──
+            ctx_error = None
+            sign = _asset_names(dynamic, "sign.o")
+            if sign:
                 try:
-                    js_resp = await s.get(url, timeout=15)
-                    if js_resp.status_code != 200:
-                        continue
-                    js_text = js_resp.text
-
-                    # Extract queryId + operationName pairs
-                    pairs = re.findall(
-                        r'queryId:"([^"]+)".+?operationName:"([^"]+)"',
-                        js_text,
+                    _transaction_ctx = ClientTransaction(
+                        BeautifulSoup(html, "html.parser"), await fetch_asset(sign[0])
                     )
-                    for qid, op_name in pairs:
-                        ops[op_name] = qid
+                    log.info(f"ClientTransaction initialized from {sign[0]}")
+                except Exception as exc:
+                    ctx_error = f"ClientTransaction init failed: {exc}"
+            else:
+                ctx_error = "sign.o script not found in startup-dynamic"
+            if ctx_error:
+                log.warning(ctx_error)
 
-                    # Extract featureSwitches for CreateTweet
-                    # Bundle format: queryId:"...",operationName:"CreateTweet",...,metadata:{featureSwitches:[...],fieldToggles:[...]}
-                    ct_features_match = re.search(
-                        r'operationName:"CreateTweet".*?featureSwitches:\[([^\]]+)\]',
-                        js_text,
-                    )
-                    if ct_features_match:
-                        raw = ct_features_match.group(1)
-                        feature_names = re.findall(r'"([^"]+)"', raw)
-                        if feature_names:
-                            # featureSwitches are sent as true by the real client
-                            ops_features = {name: True for name in feature_names}
-                            log.info(
-                                f"Scraped {len(ops_features)} feature flags for CreateTweet"
-                            )
+            # ── createTweetMutation id ──
+            match = None
+            for chunk in COMPOSER_CHUNKS:
+                for name in _asset_names(dynamic, chunk):
+                    match = CREATE_TWEET_RE.search(await fetch_asset(name))
+                    if match:
+                        break
+                if match:
+                    break
 
-                except Exception:
-                    continue
+            if match:
+                _query_id = match.group(1)
+                _provided_names = re.findall(r"(__relay_internal__pv__\w+):", match.group(2) or "")
+                log.info(f"Scraped {CREATE_TWEET_OP}={_query_id}")
+            else:
+                log.warning(f"{CREATE_TWEET_OP} not found in composer chunks, keeping cache/fallback")
 
-            if ops:
+            if match and not ctx_error:
                 _last_scrape_error = None
-                _gql_cache = ops
                 _cache_ts = time.time()
                 _last_scrape_attempt = 0  # reset so next cache expiry retries immediately
-                ct_id = ops.get("CreateTweet", "NOT FOUND")
-                log.info(f"Scraped {len(ops)} operations. CreateTweet={ct_id}")
             else:
-                _last_scrape_error = (
-                    f"0 operations from {len(script_urls)} bundles "
-                    f"(x.com returned {resp.status_code}; the IP may be blocked)"
-                )
-                log.warning(
-                    "Bundle scrape returned 0 operations, keeping cache/fallback"
-                )
-
-            if ops_features:
-                _features_cache = ops_features
-            elif not _features_cache:
-                log.warning("No features scraped, will use FALLBACK_FEATURES")
+                _last_scrape_error = ctx_error or f"{CREATE_TWEET_OP} not found in composer chunks"
 
     except Exception as exc:
         _last_scrape_error = str(exc)
         log.warning(f"Bundle scrape failed: {exc}, using fallback")
 
-    return _gql_cache
-
 
 async def _get_create_tweet_id(force_refresh: bool = False) -> str:
-    """Return the current CreateTweet queryId."""
-    global _gql_cache, _cache_ts
+    """Return the current createTweetMutation id."""
+    global _cache_ts, _last_scrape_attempt
 
     if force_refresh:
         _cache_ts = 0  # bust cache
+        _last_scrape_attempt = 0
 
-    ops = await _scrape_gql_config()
-    qid = ops.get("CreateTweet")
-    if qid:
-        return qid
+    await _scrape_gql_config()
+    if _query_id:
+        return _query_id
 
-    log.warning("CreateTweet not found in scraped ops, using fallback")
+    log.warning(f"{CREATE_TWEET_OP} id not scraped, using fallback")
     return FALLBACK_QUERY_ID
 
 
-def _get_features() -> dict:
-    """Return the best available features dict."""
-    return _features_cache if _features_cache else FALLBACK_FEATURES
+def _create_tweet_url(query_id: str) -> str:
+    return f"{GRAPHQL_URL}/{query_id}/{CREATE_TWEET_OP}"
+
+
+def _provided_variables() -> dict:
+    names = _provided_names or list(PROVIDED_VARIABLES)
+    return {name: PROVIDED_VARIABLES.get(name, False) for name in names}
 
 
 # ── App setup ───────────────────────────────────────────────────────
@@ -286,7 +246,8 @@ def _build_headers(auth_token: str, ct0: str, method: str = "POST", path: str = 
         "referer": "https://x.com/compose/post",
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
+        # Every call goes to api.x.com or upload.x.com from an x.com page
+        "sec-fetch-site": "same-site",
     }
 
     # Generate x-client-transaction-id if we have the context
@@ -303,23 +264,15 @@ def _build_headers(auth_token: str, ct0: str, method: str = "POST", path: str = 
 def _build_tweet_payload(
     text: str, query_id: str, media_ids: list[str] | None = None
 ) -> dict:
-    media_entities = []
+    # Same shape as the web composer: optional fields only when set
+    variables: dict = {"tweet_text": text}
     if media_ids:
-        media_entities = [{"media_id": mid, "tagged_users": []} for mid in media_ids]
-
-    return {
-        "variables": {
-            "tweet_text": text,
-            "dark_request": False,
-            "media": {
-                "media_entities": media_entities,
-                "possibly_sensitive": False,
-            },
-            "semantic_annotation_ids": [],
-        },
-        "features": _get_features(),
-        "queryId": query_id,
-    }
+        variables["media"] = {
+            "media_entities": [{"media_id": mid} for mid in media_ids],
+            "possibly_sensitive": False,
+        }
+    variables.update(_provided_variables())
+    return {"queryId": query_id, "variables": variables}
 
 
 # ── Media upload ────────────────────────────────────────────────────
@@ -499,9 +452,9 @@ async def _attempt_tweet(
     ct0: str,
     media_ids: list[str] | None = None,
 ) -> dict:
-    """Fire a single CreateTweet request. Returns raw parsed JSON."""
-    path = f"/i/api/graphql/{query_id}/CreateTweet"
-    url = f"https://x.com{path}"
+    """Fire a single createTweetMutation request. Returns raw parsed JSON."""
+    url = _create_tweet_url(query_id)
+    path = url.removeprefix("https://api.x.com")
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
         body = _build_tweet_payload(text, query_id, media_ids)
@@ -603,17 +556,369 @@ async def post_tweet(
         return TweetResponse(success=False, error=error_str)
 
 
+# ── Login ───────────────────────────────────────────────────────────
+# Logs in through X's web login flow (onboarding/task.json) and hands back the
+# auth_token + ct0 cookies, so users without DevTools (phones) can connect.
+# X can stop the flow to ask for a 2FA code or an email/phone check, so each
+# login stays in memory between calls for LOGIN_TTL seconds. The password is
+# kept only until X accepts it and is never logged or written anywhere.
+TASK_URL = "https://api.x.com/1.1/onboarding/task.json"
+TASK_PATH = "/1.1/onboarding/task.json"
+LOGIN_TTL = 600
+MAX_PENDING_LOGINS = 200
+MAX_CODE_ATTEMPTS = 3
+
+# Steps the user has to answer, and what to call them in the response
+CHALLENGE_SUBTASKS = {
+    "LoginTwoFactorAuthChallenge": "two_factor",
+    "LoginAcid": "confirmation_code",
+    "LoginEnterAlternateIdentifierSubtask": "email_or_phone",
+}
+
+
+class LoginError(Exception):
+    """The login can't go on. The message is a "CODE: reason" shown to callers."""
+
+
+class _PendingLogin:
+    def __init__(self, session: AsyncSession, username: str, password: str):
+        self.session = session
+        self.username = username
+        self.password: str | None = password
+        self.guest_token = ""
+        self.flow_token = ""
+        self.subtasks: list[dict] = []
+        self.code_attempts = 0
+        self.created = time.time()
+        self.lock = asyncio.Lock()
+
+
+_pending_logins: dict[str, _PendingLogin] = {}
+
+
+def require_service_key(x_api_key: str | None = Header(default=None, alias="x-api-key")):
+    # Without a key, /login would let anyone use this server to try X passwords
+    if not SERVICE_API_KEY:
+        raise HTTPException(status_code=503, detail="SERVICE_API_KEY must be set to use /login")
+    if x_api_key != SERVICE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+
+
+def _cookie(cookies, name: str) -> str | None:
+    """Read a cookie by name whatever its domain (X sets them on .x.com and x.com)."""
+    for c in cookies.jar:
+        if c.name == name and c.value:
+            return c.value
+    return None
+
+
+async def _close_login(login_id: str) -> None:
+    login = _pending_logins.pop(login_id, None)
+    if login:
+        login.password = None
+        try:
+            await login.session.close()
+        except Exception:
+            pass
+
+
+async def _expire_logins() -> None:
+    now = time.time()
+    for login_id in [k for k, v in _pending_logins.items() if now - v.created > LOGIN_TTL]:
+        await _close_login(login_id)
+
+
+def _login_headers(login: _PendingLogin) -> dict:
+    headers = {
+        "authorization": f"Bearer {BEARER}",
+        "content-type": "application/json",
+        "x-guest-token": login.guest_token,
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "en",
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "origin": "https://x.com",
+        "referer": "https://x.com/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+    }
+    # The web client echoes ct0 once X has set one during the flow
+    ct0 = _cookie(login.session.cookies, "ct0")
+    if ct0:
+        headers["x-csrf-token"] = ct0
+    if _transaction_ctx:
+        try:
+            headers["x-client-transaction-id"] = _transaction_ctx.generate_transaction_id(
+                method="POST", path=TASK_PATH
+            )
+        except Exception as exc:
+            log.warning(f"Transaction ID generation failed: {exc}")
+    return headers
+
+
+def _subtask_text(subtask: dict) -> str | None:
+    """The prompt X shows for a step, e.g. "Check your email for a code"."""
+    for key in ("enter_text", "cta", "enter_password"):
+        block = subtask.get(key) or {}
+        for source in (block.get("header") or {}, block):
+            for field in ("secondary_text", "primary_text"):
+                text = (source.get(field) or {}).get("text")
+                if text:
+                    return text
+    return None
+
+
+def _classify_login_error(data: dict, status_code: int) -> str:
+    errors = data.get("errors", []) if isinstance(data, dict) else []
+    if not errors:
+        if status_code in (403, 429):
+            return f"FORBIDDEN: X refused the login ({status_code}). The IP may be blocked; check PROXY_URL."
+        return f"LOGIN_FAILED: X returned {status_code}."
+
+    code = errors[0].get("code")
+    # X appends tracking junk to messages, e.g. "Wrong password! g;1720…"
+    msg = (errors[0].get("message") or "").split(" g;")[0].strip()
+
+    if code == 399:
+        return f"LOGIN_FAILED: {msg or 'X rejected the login.'}"
+    if code == 366:
+        return "LOGIN_EXPIRED: This login timed out. Start again."
+    if code == 326:
+        return "ACCOUNT_LOCKED: Account temporarily locked. Log in on x.com to unlock it."
+    if code in (88, 130):
+        return "RATE_LIMIT: Too many login attempts. Wait a while and try again."
+    if code == 226:
+        return "AUTOMATION_DETECTED: X flagged this login as automated."
+    return f"X_ERROR_{code}: {msg}"
+
+
+async def _run_task(login: _PendingLogin, body: dict, params: dict | None = None) -> None:
+    resp = await login.session.post(
+        TASK_URL, params=params, headers=_login_headers(login), json=body, timeout=30
+    )
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    if resp.status_code != 200 or not data.get("flow_token"):
+        raise LoginError(_classify_login_error(data, resp.status_code))
+    login.flow_token = data["flow_token"]
+    login.subtasks = data.get("subtasks") or []
+
+
+async def _begin_login(login: _PendingLogin) -> None:
+    # Pick up the guest cookies a browser would have before logging in
+    await login.session.get("https://x.com/i/flow/login", timeout=15)
+    resp = await login.session.post(
+        "https://api.x.com/1.1/guest/activate.json",
+        headers={"authorization": f"Bearer {BEARER}"},
+        timeout=15,
+    )
+    try:
+        guest_token = resp.json().get("guest_token")
+    except Exception:
+        guest_token = None
+    if not guest_token:
+        raise LoginError(
+            f"FORBIDDEN: X wouldn't start a login ({resp.status_code}). The IP may be blocked; check PROXY_URL."
+        )
+    login.guest_token = guest_token
+    await _run_task(
+        login,
+        {"input_flow_data": {"flow_context": {"debug_overrides": {}, "start_location": {"location": "splash_screen"}}}},
+        params={"flow_name": "login"},
+    )
+
+
+async def _advance_login(login: _PendingLogin, answer: str | None = None) -> dict:
+    """Answer every step we can on our own; stop at the first one the user must answer."""
+    for _ in range(12):
+        ids = [s.get("subtask_id") for s in login.subtasks]
+        if "LoginSuccessSubtask" in ids or _cookie(login.session.cookies, "auth_token"):
+            return await _finish_login(login)
+
+        subtask = login.subtasks[0] if login.subtasks else {}
+        sid = subtask.get("subtask_id") or ""
+
+        if sid == "LoginJsInstrumentationSubtask":
+            step = {"js_instrumentation": {"response": "{}", "link": "next_link"}}
+        elif sid == "LoginEnterUserIdentifierSSO":
+            step = {
+                "settings_list": {
+                    "setting_responses": [
+                        {"key": "user_identifier", "response_data": {"text_data": {"result": login.username}}}
+                    ],
+                    "link": "next_link",
+                }
+            }
+        elif sid == "LoginEnterPassword":
+            if not login.password:
+                raise LoginError("LOGIN_EXPIRED: X asked for the password again. Start again.")
+            step = {"enter_password": {"password": login.password, "link": "next_link"}}
+        elif sid == "AccountDuplicationCheck":
+            step = {"check_logged_in_account": {"link": "AccountDuplicationCheck_false"}}
+        elif sid in CHALLENGE_SUBTASKS:
+            if not answer:
+                return {
+                    "status": "challenge",
+                    "challenge": CHALLENGE_SUBTASKS[sid],
+                    "hint": _subtask_text(subtask),
+                }
+            step = {"enter_text": {"text": answer, "link": "next_link"}}
+            answer = None
+        elif sid == "DenyLoginSubtask":
+            raise LoginError(f"LOGIN_DENIED: {_subtask_text(subtask) or 'X blocked this login.'}")
+        elif "Arkose" in sid or "Captcha" in sid:
+            raise LoginError(
+                "CAPTCHA_REQUIRED: X wants a captcha for this login. Log in on x.com once, then try again."
+            )
+        else:
+            raise LoginError(f"UNSUPPORTED_STEP: X asked for a login step this service doesn't handle ({sid or 'none'}).")
+
+        log.info(f"Login step {sid}")
+        await _run_task(login, {"flow_token": login.flow_token, "subtask_inputs": [{"subtask_id": sid, **step}]})
+        if sid == "LoginEnterPassword":
+            login.password = None
+
+    raise LoginError("LOGIN_FAILED: X kept asking for more login steps.")
+
+
+async def _finish_login(login: _PendingLogin) -> dict:
+    auth_token = _cookie(login.session.cookies, "auth_token")
+    if not auth_token:
+        raise LoginError("LOGIN_FAILED: X finished the login but sent no session cookie.")
+
+    # The ct0 from the guest flow may not belong to the new session. X answers
+    # a mismatched ct0 with a fresh one, so check it and take the new value.
+    ct0 = _cookie(login.session.cookies, "ct0") or ""
+    path = "/1.1/account/settings.json"
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+    for _ in range(2):
+        async with AsyncSession(impersonate=BROWSER, proxies=proxies) as s:
+            resp = await s.get(
+                f"https://api.x.com{path}",
+                headers=_build_headers(auth_token, ct0, method="GET", path=path),
+                timeout=15,
+            )
+        if resp.status_code == 200:
+            try:
+                username = resp.json().get("screen_name")
+            except Exception:
+                username = None
+            return {"status": "connected", "auth_token": auth_token, "ct0": ct0, "username": username}
+        fresh = _cookie(resp.cookies, "ct0")
+        if not fresh or fresh == ct0:
+            break
+        ct0 = fresh
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    raise LoginError(_classify_error(data, resp.status_code) or f"LOGIN_FAILED: X didn't accept the new session ({resp.status_code}).")
+
+
+class LoginStartRequest(BaseModel):
+    username: str = Field(..., description="X username, email or phone")
+    password: str
+
+
+class LoginContinueRequest(BaseModel):
+    login_id: str
+    code: str = Field(..., description="2FA code, confirmation code, or the email/phone X asked for")
+
+
+class LoginResponse(BaseModel):
+    status: str  # "connected" | "challenge" | "failed"
+    login_id: str | None = None
+    challenge: str | None = None  # "two_factor" | "confirmation_code" | "email_or_phone"
+    hint: str | None = None
+    auth_token: str | None = None
+    ct0: str | None = None
+    username: str | None = None
+    error: str | None = None
+
+
+def _login_response(login_id: str, result: dict) -> LoginResponse:
+    if result["status"] == "challenge":
+        return LoginResponse(login_id=login_id, **result)
+    return LoginResponse(**result)
+
+
+@app.post("/login/start", response_model=LoginResponse, dependencies=[Depends(require_service_key)])
+async def login_start(payload: LoginStartRequest):
+    await _expire_logins()
+    if len(_pending_logins) >= MAX_PENDING_LOGINS:
+        return LoginResponse(status="failed", error="RATE_LIMIT: Too many logins in progress. Try again in a few minutes.")
+
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+    login_id = uuid.uuid4().hex
+    login = _PendingLogin(
+        AsyncSession(impersonate=BROWSER, proxies=proxies),
+        payload.username.strip().lstrip("@"),
+        payload.password,
+    )
+    _pending_logins[login_id] = login
+
+    async with login.lock:
+        try:
+            await _begin_login(login)
+            result = await _advance_login(login)
+        except LoginError as exc:
+            await _close_login(login_id)
+            log.warning(f"Login failed: {exc}")
+            return LoginResponse(status="failed", error=str(exc))
+        except Exception as exc:
+            await _close_login(login_id)
+            log.warning(f"Login error: {exc}")
+            return LoginResponse(status="failed", error=f"NETWORK_ERROR: {exc}")
+
+    if result["status"] != "challenge":
+        await _close_login(login_id)
+    return _login_response(login_id, result)
+
+
+@app.post("/login/continue", response_model=LoginResponse, dependencies=[Depends(require_service_key)])
+async def login_continue(payload: LoginContinueRequest):
+    await _expire_logins()
+    login = _pending_logins.get(payload.login_id)
+    if not login:
+        return LoginResponse(status="failed", error="LOGIN_EXPIRED: This login timed out. Start again.")
+
+    async with login.lock:
+        try:
+            result = await _advance_login(login, payload.code.strip())
+        except LoginError as exc:
+            # A mistyped code can be tried again on the same step, a few times
+            login.code_attempts += 1
+            retry = str(exc).startswith("LOGIN_FAILED") and login.code_attempts < MAX_CODE_ATTEMPTS
+            if not retry:
+                await _close_login(payload.login_id)
+            log.warning(f"Login step failed: {exc}")
+            return LoginResponse(
+                status="failed",
+                login_id=payload.login_id if retry else None,
+                error=str(exc),
+            )
+        except Exception as exc:
+            await _close_login(payload.login_id)
+            log.warning(f"Login error: {exc}")
+            return LoginResponse(status="failed", error=f"NETWORK_ERROR: {exc}")
+
+    if result["status"] != "challenge":
+        await _close_login(payload.login_id)
+    return _login_response(payload.login_id, result)
+
+
 @app.get("/health")
 async def health():
     """Health check — reports current cache state without triggering a scrape."""
-    features = _get_features()
-    query_id = _gql_cache.get("CreateTweet", FALLBACK_QUERY_ID)
     return {
         "status": "ok",
-        "create_tweet_query_id": query_id,
-        "query_id_source": "scraped" if _gql_cache else "fallback",
-        "features_source": "scraped" if _features_cache else "fallback",
-        "features_count": len(features),
+        "create_tweet_query_id": _query_id or FALLBACK_QUERY_ID,
+        "query_id_source": "scraped" if _query_id else "fallback",
+        "provided_variables": len(_provided_variables()),
         "transaction_ctx": "active" if _transaction_ctx else "unavailable",
         "cache_age_seconds": int(time.time() - _cache_ts) if _cache_ts else None,
         "last_scrape_error": _last_scrape_error,
@@ -638,8 +943,8 @@ async def debug_tweet(
     """Fire a test tweet and return the full raw X response for debugging."""
     text = f"debug {datetime.datetime.utcnow().isoformat()}"
     query_id = await _get_create_tweet_id()
-    path = f"/i/api/graphql/{query_id}/CreateTweet"
-    url = f"https://x.com{path}"
+    url = _create_tweet_url(query_id)
+    path = url.removeprefix("https://api.x.com")
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
         body = _build_tweet_payload(text, query_id)
@@ -654,7 +959,6 @@ async def debug_tweet(
         "response_headers": dict(resp.headers),
         "response_body": resp.json(),
         "query_id_used": query_id,
-        "features_source": "scraped" if _features_cache else "fallback",
         "transaction_id_active": _transaction_ctx is not None,
         "tweet_text": text,
     }
